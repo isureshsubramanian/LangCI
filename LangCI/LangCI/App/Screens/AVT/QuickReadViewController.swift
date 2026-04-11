@@ -1,45 +1,44 @@
-// ReadingAloudDrillViewController.swift
+// QuickReadViewController.swift
 // LangCI
 //
-// Shows the passage text, records the user reading it aloud with real-time
-// voice metrics: pitch (Hz), loudness (dB), and words-per-minute (WPM)
-// via live speech recognition.
+// Live voice metrics for reading any physical text (newspaper, book, etc.)
+// without needing a passage in the app. Shows real-time pitch (Hz),
+// loudness (dB), and speed (WPM) gauges. Nothing is saved to the database.
 //
 // Flow:
-//   1. Passage text shown in scrollable card
-//   2. User taps "Start Reading" — three circular gauges animate live as
-//      they read, timer runs, word count increments via speech recognition
-//   3. User taps "Done" — recording stops, final stats computed, saved
-//   4. Results card appears showing summary + coaching hint
+//   1. User taps "Start Reading" — gauges animate live
+//   2. User reads from their physical newspaper / book
+//   3. User taps "Done" — final stats shown on screen
+//   4. Tap "Read Again" to reset, or navigate back
 
 import UIKit
 import AVFoundation
 
-final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDelegate {
-
-    // MARK: - Input
-
-    private let passage: ReadingPassage
+final class QuickReadViewController: UIViewController, VoiceMetricsDelegate {
 
     // MARK: - Engine
 
     private var metricsEngine: VoiceMetricsEngine?
-    private var recordingURL: URL?
     private var startTime: Date?
 
     // Running loudness samples for final average
     private var loudnessSamples: [Double] = []
     private var peakLoudness: Double = -160
 
-    /// Set when engine falls back to syllable estimation — triggers Whisper post-session
+    /// Set to true when the engine falls back to syllable estimation
+    /// (speech recognition unavailable). Triggers Whisper post-session.
     private var needsWhisperPostSession = false
 
     // MARK: - Display timer
 
     private var displayTimer: Timer?
 
-    // MARK: - Language
+    // MARK: - UI
 
+    private let scrollView = UIScrollView()
+    private let contentStack = UIStackView()
+
+    // Language picker
     private let languageOptions: [(label: String, locale: Locale)] = [
         ("தமிழ் Tamil", Locale(identifier: "ta-IN")),
         ("English", Locale(identifier: "en-US"))
@@ -47,16 +46,8 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
     private let languageControl = UISegmentedControl()
     private var selectedLocale: Locale { languageOptions[languageControl.selectedSegmentIndex].locale }
 
-    // MARK: - UI
-
-    private let scrollView = UIScrollView()
-    private let contentStack = UIStackView()
-
-    // Passage card
-    private let passageCard = LCCard()
-    private let passageTitleLabel = UILabel()
-    private let passageMetaLabel = UILabel()
-    private let passageBodyLabel = UILabel()
+    // Instruction card
+    private let instructionCard = LCCard()
 
     // Metrics card (the three gauges)
     private let metricsCard = LCCard()
@@ -71,13 +62,13 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
         title: "Loudness", unit: "dB",
         minValue: -60, maxValue: 0,
         color: .lcBlue,
-        warningThreshold: -10,  // very loud
+        warningThreshold: -10,
         format: "%.0f"))
     private let wpmGauge = CircularGaugeView(config: .init(
         title: "Speed", unit: "WPM",
         minValue: 0, maxValue: 250,
         color: .lcPurple,
-        warningThreshold: 180,  // too fast
+        warningThreshold: 180,
         format: "%.0f"))
 
     // Real-time word count label
@@ -96,22 +87,11 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
     // MARK: - State
 
     private enum DrillState {
-        case idle
-        case recording
-        case saving
-        case done
+        case idle, recording, done
     }
     private var state: DrillState = .idle {
         didSet { updateForState() }
     }
-
-    // MARK: - Init
-
-    init(passage: ReadingPassage) {
-        self.passage = passage
-        super.init(nibName: nil, bundle: nil)
-    }
-    required init?(coder: NSCoder) { fatalError() }
 
     // MARK: - Lifecycle
 
@@ -132,7 +112,7 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
     // MARK: - Setup
 
     private func setupNavigation() {
-        title = passage.title
+        title = "Read Newspaper"
         navigationItem.largeTitleDisplayMode = .never
         view.backgroundColor = .lcBackground
     }
@@ -163,15 +143,15 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
             contentStack.widthAnchor.constraint(equalTo: scrollView.widthAnchor)
         ])
 
-        // Language picker for speech recognition
+        // Language picker
         for (i, option) in languageOptions.enumerated() {
             languageControl.insertSegment(withTitle: option.label, at: i, animated: false)
         }
         languageControl.selectedSegmentIndex = 0
         contentStack.addArrangedSubview(languageControl)
 
-        buildPassageCard()
-        contentStack.addArrangedSubview(passageCard)
+        buildInstructionCard()
+        contentStack.addArrangedSubview(instructionCard)
 
         buildMetricsCard()
         contentStack.addArrangedSubview(metricsCard)
@@ -185,39 +165,45 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
         resultsCard.isHidden = true
     }
 
-    private func buildPassageCard() {
-        passageTitleLabel.text = passage.title
-        passageTitleLabel.font = UIFont.systemFont(ofSize: 20, weight: .bold)
-        passageTitleLabel.textColor = .label
-        passageTitleLabel.numberOfLines = 0
+    private func buildInstructionCard() {
+        let icon = UIImageView(image: UIImage(systemName: "newspaper.fill"))
+        icon.tintColor = .lcTeal
+        icon.contentMode = .scaleAspectFit
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 36).isActive = true
 
-        passageMetaLabel.text = "\(passage.category.emoji) \(passage.category.label) • \(passage.difficultyLabel) • \(passage.wordCount) words"
-        passageMetaLabel.font = UIFont.lcCaption()
-        passageMetaLabel.textColor = .secondaryLabel
+        let titleLabel = UILabel()
+        titleLabel.text = "Read from any text"
+        titleLabel.font = UIFont.systemFont(ofSize: 20, weight: .bold)
+        titleLabel.textColor = .label
 
-        passageBodyLabel.text = passage.body
-        passageBodyLabel.font = UIFont.systemFont(ofSize: 18)
-        passageBodyLabel.textColor = .label
-        passageBodyLabel.numberOfLines = 0
-        passageBodyLabel.setContentHuggingPriority(.defaultLow, for: .vertical)
+        let bodyLabel = UILabel()
+        bodyLabel.text = "Hold your newspaper, book, or any printed text and read aloud. The app will measure your pitch, loudness, and speed in real time."
+        bodyLabel.font = UIFont.lcBody()
+        bodyLabel.textColor = .secondaryLabel
+        bodyLabel.numberOfLines = 0
 
-        let stack = UIStackView(arrangedSubviews: [passageTitleLabel, passageMetaLabel, passageBodyLabel])
+        let headerRow = UIStackView(arrangedSubviews: [icon, titleLabel])
+        headerRow.axis = .horizontal
+        headerRow.spacing = 12
+        headerRow.alignment = .center
+
+        let stack = UIStackView(arrangedSubviews: [headerRow, bodyLabel])
         stack.axis = .vertical
-        stack.spacing = 10
-        stack.setCustomSpacing(18, after: passageMetaLabel)
+        stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        passageCard.addSubview(stack)
+        instructionCard.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: passageCard.topAnchor, constant: LC.cardPadding),
-            stack.leadingAnchor.constraint(equalTo: passageCard.leadingAnchor, constant: LC.cardPadding),
-            stack.trailingAnchor.constraint(equalTo: passageCard.trailingAnchor, constant: -LC.cardPadding),
-            stack.bottomAnchor.constraint(equalTo: passageCard.bottomAnchor, constant: -LC.cardPadding)
+            stack.topAnchor.constraint(equalTo: instructionCard.topAnchor, constant: LC.cardPadding),
+            stack.leadingAnchor.constraint(equalTo: instructionCard.leadingAnchor, constant: LC.cardPadding),
+            stack.trailingAnchor.constraint(equalTo: instructionCard.trailingAnchor, constant: -LC.cardPadding),
+            stack.bottomAnchor.constraint(equalTo: instructionCard.bottomAnchor, constant: -LC.cardPadding)
         ])
     }
 
     private func buildMetricsCard() {
-        // Three gauges side by side
         gaugeStack.axis = .horizontal
         gaugeStack.distribution = .fillEqually
         gaugeStack.spacing = 8
@@ -229,7 +215,6 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
             gaugeStack.addArrangedSubview(gauge)
         }
 
-        // Word count label below gauges
         wordCountLabel.text = "Words detected: 0"
         wordCountLabel.font = UIFont.lcBodyBold()
         wordCountLabel.textColor = .secondaryLabel
@@ -310,17 +295,18 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
             startButton.isEnabled = true
             timerLabel.text = "0:00"
             metricsCard.isHidden = true
+            instructionCard.isHidden = false
         case .recording:
             startButton.isHidden = true
             stopButton.isHidden = false
             metricsCard.isHidden = false
-        case .saving:
-            stopButton.isEnabled = false
+            instructionCard.isHidden = true
         case .done:
             startButton.isHidden = false
             stopButton.isHidden = true
             startButton.setTitle("Read Again", for: .normal)
-            metricsCard.isHidden = false  // keep gauges visible with final values
+            metricsCard.isHidden = false
+            instructionCard.isHidden = true
         }
     }
 
@@ -328,7 +314,6 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
 
     @objc private func didTapStart() {
         lcHaptic(.light)
-        // Reset for a fresh take
         resultsCard.isHidden = true
         loudnessSamples.removeAll()
         peakLoudness = -160
@@ -344,16 +329,16 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
 
         Task {
             do {
-                let url = try await engine.start()
+                // We don't need the recording URL — pass true to skip file writing
+                _ = try await engine.start()
                 await MainActor.run {
-                    self.recordingURL = url
                     self.startTime = Date()
                     self.state = .recording
                     self.startDisplayTimer()
                 }
             } catch {
                 await MainActor.run {
-                    self.lcShowToast("Couldn't start recording: \(error.localizedDescription)",
+                    self.lcShowToast("Couldn't start: \(error.localizedDescription)",
                                      icon: "exclamationmark.triangle.fill",
                                      tint: .lcRed)
                 }
@@ -365,80 +350,39 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
         lcHaptic(.light)
         displayTimer?.invalidate()
         displayTimer = nil
-        state = .saving
 
         let engine = metricsEngine
         let finalWordCount = engine?.wordCount ?? 0
         let finalWPM = engine?.currentWPM ?? 0
         let finalPitch = engine?.currentPitch ?? 0
+        let recordingURL = engine?.recordingURL
         engine?.stop()
 
         let duration = Date().timeIntervalSince(startTime ?? Date())
 
         // Compute loudness stats
         let nonMinimum = loudnessSamples.filter { $0 > -160 }
-        let avgDb: Double
-        if nonMinimum.isEmpty {
-            avgDb = -160
-        } else {
-            avgDb = nonMinimum.reduce(0, +) / Double(nonMinimum.count)
-        }
+        let avgDb: Double = nonMinimum.isEmpty ? -160
+            : nonMinimum.reduce(0, +) / Double(nonMinimum.count)
 
-        // Use recognised word count if available, else fall back to passage word count
-        let wordCount = finalWordCount > 0 ? finalWordCount : passage.wordCount
-        let wpm: Double = finalWPM > 0 ? finalWPM
-            : (duration > 0 ? (Double(wordCount) / duration) * 60.0 : 0)
+        lcHapticSuccess()
+        state = .done
+        showResults(wordCount: finalWordCount, wpm: finalWPM,
+                    avgDb: avgDb, avgPitch: finalPitch, duration: duration)
 
-        let session = ReadingSession(
-            passageId: passage.id == 0 ? nil : passage.id,
-            passageTitle: passage.title,
-            passageBody: passage.body,
-            wordCount: wordCount,
-            durationSeconds: duration,
-            wordsPerMinute: wpm,
-            avgLoudnessDb: avgDb,
-            peakLoudnessDb: peakLoudness,
-            audioFilePath: recordingURL?.path,
-            notes: nil,
-            avgPitchHz: finalPitch,
-            recordedAt: Date()
-        )
-
-        Task {
-            do {
-                let saved = try await ServiceLocator.shared.readingAloudService.saveSession(session)
-                try? await ServiceLocator.shared.milestoneService.autoDetectFirsts()
-                await MainActor.run {
-                    self.lcHapticSuccess()
-                    self.state = .done
-                    self.showResults(for: saved, avgPitch: finalPitch)
-                    self.stopButton.isEnabled = true
-
-                    // If speech recognition was unavailable, try Whisper
-                    if self.needsWhisperPostSession,
-                       let url = self.recordingURL,
-                       WhisperTranscriptionService.shared.hasAPIKey {
-                        self.runWhisperPostSession(
-                            session: saved, audioURL: url,
-                            avgPitch: finalPitch)
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    self.lcShowToast("Save failed",
-                                     icon: "exclamationmark.triangle.fill",
-                                     tint: .lcRed)
-                    self.state = .idle
-                    self.stopButton.isEnabled = true
-                }
-            }
+        // If speech recognition was unavailable, try Whisper for accurate WPM
+        if needsWhisperPostSession, let url = recordingURL,
+           WhisperTranscriptionService.shared.hasAPIKey {
+            runWhisperPostSession(audioURL: url, duration: duration,
+                                  avgDb: avgDb, avgPitch: finalPitch)
         }
     }
 
-    /// Sends recorded audio to Whisper, then updates the results card
-    /// and re-saves the session with accurate word count / WPM.
-    private func runWhisperPostSession(session: ReadingSession, audioURL: URL,
-                                        avgPitch: Double) {
+    /// Sends the recorded audio to OpenAI Whisper for accurate transcription,
+    /// then updates the results card with the real word count / WPM.
+    private func runWhisperPostSession(audioURL: URL, duration: Double,
+                                        avgDb: Double, avgPitch: Double) {
+        // Show analysing indicator
         let analysingLabel = UILabel()
         analysingLabel.text = "⏳ Analysing speech with Whisper…"
         analysingLabel.font = UIFont.lcCaption()
@@ -449,34 +393,27 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
         let lang = selectedLocale.language.languageCode?.identifier
             ?? selectedLocale.identifier.components(separatedBy: "-").first
 
-        // NOTE: Do NOT pass a prompt hint — Whisper hallucinates it into
-        // the output for low-resource languages like Tamil.
-
         Task {
             do {
+                // NOTE: Do NOT pass a prompt hint — Whisper hallucinates it into
+                // the output for low-resource languages like Tamil.
                 let result = try await WhisperTranscriptionService.shared
                     .transcribe(fileURL: audioURL, language: lang)
 
-                guard result.wordCount > 0 else {
-                    await MainActor.run {
-                        self.resultsContent.viewWithTag(999)?.removeFromSuperview()
-                    }
-                    return
-                }
-
-                let whisperWPM = session.durationSeconds > 2
-                    ? (Double(result.wordCount) / session.durationSeconds) * 60.0 : 0
-
-                // Update the saved session in the database
-                var updated = session
-                updated.wordCount = result.wordCount
-                updated.wordsPerMinute = whisperWPM
-                _ = try? await ServiceLocator.shared.readingAloudService.saveSession(updated)
-
                 await MainActor.run {
+                    // Remove analysing label
                     self.resultsContent.viewWithTag(999)?.removeFromSuperview()
-                    self.showResults(for: updated, avgPitch: avgPitch)
 
+                    guard result.wordCount > 0 else { return }
+
+                    let whisperWPM = duration > 2
+                        ? (Double(result.wordCount) / duration) * 60.0 : 0
+
+                    // Rebuild the results with accurate Whisper data
+                    self.showResults(wordCount: result.wordCount, wpm: whisperWPM,
+                                     avgDb: avgDb, avgPitch: avgPitch, duration: duration)
+
+                    // Add a note that this was Whisper-analysed
                     let whisperNote = UILabel()
                     whisperNote.text = "✓ WPM refined by Whisper (\(result.wordCount) words detected)"
                     whisperNote.font = UIFont.lcCaption()
@@ -502,11 +439,9 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
     // MARK: - VoiceMetricsDelegate
 
     func voiceMetrics(didUpdate pitch: Double, loudness: Double, wordCount: Int, wpm: Double) {
-        // Store samples for final average
         loudnessSamples.append(loudness)
         if loudness > peakLoudness { peakLoudness = loudness }
 
-        // Update gauges
         if pitch > 0 {
             pitchGauge.setValue(pitch)
         }
@@ -552,7 +487,8 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
 
     // MARK: - Results card
 
-    private func showResults(for session: ReadingSession, avgPitch: Double = 0) {
+    private func showResults(wordCount: Int, wpm: Double,
+                              avgDb: Double, avgPitch: Double, duration: Double) {
         resultsContent.arrangedSubviews.forEach { $0.removeFromSuperview() }
 
         let header = UILabel()
@@ -561,66 +497,60 @@ final class ReadingAloudDrillViewController: UIViewController, VoiceMetricsDeleg
         header.textColor = .label
         resultsContent.addArrangedSubview(header)
 
-        let wpmText   = String(format: "%.0f", session.wordsPerMinute)
-        let dbText    = String(format: "%.0f", session.avgLoudnessDb)
-        let duration  = formatDuration(session.durationSeconds)
-        let pitch     = session.avgPitchHz > 0 ? session.avgPitchHz : avgPitch
-        let pitchText = pitch > 0 ? String(format: "%.0f Hz", pitch) : "—"
+        let wpmText   = String(format: "%.0f", wpm)
+        let dbText    = String(format: "%.0f", avgDb)
+        let pitchText = avgPitch > 0 ? String(format: "%.0f Hz", avgPitch) : "—"
+        let durText   = formatDuration(duration)
 
         let statRow = LCStatRow(items: [
-            .init(label: "WPM",       value: wpmText,   tint: .lcPurple),
-            .init(label: "Avg dB",    value: dbText,    tint: .lcBlue),
-            .init(label: "Pitch",     value: pitchText, tint: .lcTeal),
-            .init(label: "Duration",  value: duration,  tint: .systemGray)
+            .init(label: "WPM",      value: wpmText,   tint: .lcPurple),
+            .init(label: "Avg dB",   value: dbText,    tint: .lcBlue),
+            .init(label: "Pitch",    value: pitchText, tint: .lcTeal),
+            .init(label: "Duration", value: durText,   tint: .systemGray)
         ])
         resultsContent.addArrangedSubview(statRow)
 
-        // Bands explainer
-        let bandLabel = UILabel()
-        bandLabel.text = "Speed: \(session.wpmBand.label) • Loudness: \(session.loudnessBand.label)"
-        bandLabel.font = UIFont.lcBodyBold()
-        bandLabel.textColor = .label
-        bandLabel.numberOfLines = 0
-        resultsContent.addArrangedSubview(bandLabel)
-
-        // Word count comparison
-        let wordLabel = UILabel()
-        let detected = metricsEngine?.wordCount ?? 0
-        if detected > 0 {
-            wordLabel.text = "Words detected: \(detected) of \(passage.wordCount) in passage"
-        } else {
-            wordLabel.text = "\(passage.wordCount) words in passage"
+        if wordCount > 0 {
+            let wordLabel = UILabel()
+            wordLabel.text = "Words detected: \(wordCount)"
+            wordLabel.font = UIFont.lcCaption()
+            wordLabel.textColor = .secondaryLabel
+            resultsContent.addArrangedSubview(wordLabel)
         }
-        wordLabel.font = UIFont.lcCaption()
-        wordLabel.textColor = .secondaryLabel
-        wordLabel.numberOfLines = 0
-        resultsContent.addArrangedSubview(wordLabel)
 
+        // Coaching hints
         let hintLabel = UILabel()
-        hintLabel.text = coachingHint(for: session)
+        hintLabel.numberOfLines = 0
         hintLabel.font = UIFont.lcCaption()
         hintLabel.textColor = .secondaryLabel
-        hintLabel.numberOfLines = 0
-        resultsContent.addArrangedSubview(hintLabel)
+        var hints: [String] = []
+        if wpm > 0 && wpm < 100 {
+            hints.append("Try reading a bit faster — aim for 120-150 WPM.")
+        } else if wpm >= 100 && wpm < 140 {
+            hints.append("Nice steady pace. Push a little faster as you get comfortable.")
+        } else if wpm >= 140 && wpm <= 180 {
+            hints.append("Great natural pace — that's the sweet spot.")
+        } else if wpm > 180 {
+            hints.append("You're reading fast. Slow down slightly for clarity.")
+        }
+        if avgDb > -160 && avgDb < -40 {
+            hints.append("Speak up a bit — your voice was very soft.")
+        } else if avgDb >= -20 {
+            hints.append("A little quieter would be more comfortable.")
+        }
+        if !hints.isEmpty {
+            hintLabel.text = hints.joined(separator: " ")
+            resultsContent.addArrangedSubview(hintLabel)
+        }
+
+        let noteLabel = UILabel()
+        noteLabel.text = "This session is not saved — it's for quick practice only."
+        noteLabel.font = UIFont.lcCaption()
+        noteLabel.textColor = .tertiaryLabel
+        noteLabel.numberOfLines = 0
+        resultsContent.addArrangedSubview(noteLabel)
 
         resultsCard.isHidden = false
-    }
-
-    private func coachingHint(for session: ReadingSession) -> String {
-        var parts: [String] = []
-        switch session.wpmBand {
-        case .slow:       parts.append("Try reading a bit faster — aim for 120–150 WPM.")
-        case .developing: parts.append("Nice steady pace. Push a little faster as you get comfortable.")
-        case .natural:    parts.append("Great natural pace — that's the sweet spot.")
-        case .fast:       parts.append("You're reading fast. Slow down slightly for clarity.")
-        }
-        switch session.loudnessBand {
-        case .quiet:       parts.append("Speak up a bit — your voice was very soft.")
-        case .soft:        parts.append("A touch louder will help your implant hear you better.")
-        case .comfortable: parts.append("Loudness is right where it should be.")
-        case .loud:        parts.append("A little quieter would be more comfortable.")
-        }
-        return parts.joined(separator: " ")
     }
 
     private func formatDuration(_ seconds: Double) -> String {
